@@ -173,16 +173,49 @@ def plot_power_curve(power_curve_times, power_curve_powers):
     plt.xlabel('Time (s)')
     plt.semilogx()
 
+def quadrants(bounds):
+    lat1, lon1, lat2, lon2 = bounds
+    yield (lat1, lon1, lat1 + (lat2 - lat1) / 2, lon1 + (lon2 - lon1) / 2)
+    yield (lat1 + (lat2 - lat1) / 2, lon1, lat2, lon1 + (lon2 - lon1) / 2)
+    yield (lat1, lon1 + (lon2 - lon1) / 2, lat1 + (lat2 - lat1) / 2, lon2)
+    yield (lat1 + (lat2 - lat1) / 2, lon1 + (lon2 - lon1) / 2, lat2, lon2)
+
+@cache_to_disk(CACHE_DAYS)
+def cached_leaf_find_segments_v4(bounds):
+    segments = StravaAPI.instance().client.explore_segments(bounds=bounds, activity_type='riding', min_cat=1)
+    found = list(segments)
+    return found
+
+def bound_area(bounds):
+    lat1, lon1, lat2, lon2 = bounds
+    return (lat2 - lat1) * (lon2 - lon1)
+
+def recursive_find_segments(bounds, found_previously, initial_bound_area=None, leaves=64):
+    if initial_bound_area is None:
+        initial_bound_area = bound_area(bounds)
+    found = cached_leaf_find_segments_v4(bounds)
+    for segment in found:
+        if segment.id not in found_previously:
+            yield segment
+            found_previously.add(segment.id)
+    if found and len(found) > 1 and bound_area(bounds) >= initial_bound_area / leaves * 4 - 1e-12:
+        for quad in quadrants(bounds):
+            yield from recursive_find_segments(quad, found_previously, initial_bound_area=initial_bound_area)
+
+
 if __name__ == '__main__':
     # power_curve_times, power_curve_powers = get_max_power_curve()
     # plot_power_curve(power_curve_times, power_curve_powers)
     # plt.savefig('power_curve.png')
-    bounds = [42.513076,-72.181450,43.618804,-70.774689]
-    # bounds = [44.209880, -68.438608, 44.486288, -67.930362]
+    # bounds = [42.513076,-72.181450,43.618804,-70.774689]
+    # for quad in quadrants(bounds):
+    #     print(quad)
+    # blah
+    bounds = [44.209880, -68.438608, 44.486288, -67.930362]
     # bounds = [44.307772,-68.285002, 44.359806,-68.253086]
-    segments = StravaAPI.instance().client.explore_segments(bounds=bounds, activity_type='riding', min_cat=1)
-    segments = (seg for seg in segments if float('%f' % seg.elev_difference) > 83)
+    segments = recursive_find_segments(bounds, set())
+    segments = (seg for seg in segments if float('%f' % seg.elev_difference) > 75)
     for i, segment in enumerate(segments):
-        if i > 10:
-            break
+        # if i > 20:
+        #     break
         print("%.1f %.1f %.0f %s" % (segment.avg_grade, segment.distance, segment.elev_difference, segment.name))
