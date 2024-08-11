@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import datetime
 from functools import wraps
 import json
@@ -19,6 +20,7 @@ import polyline
 from scipy.signal import savgol_filter
 import jax.numpy as jnp
 import pandas as pd
+from tqdm import tqdm
 
 from elevation import get_elevation
 
@@ -204,17 +206,23 @@ def bound_area(bounds):
     lat1, lon1, lat2, lon2 = bounds
     return (lat2 - lat1) * (lon2 - lon1)
 
-def recursive_find_segments(bounds, found_previously, initial_bound_area=None, leaves=64):
+def recursive_find_segments(bounds, found_previously, initial_bound_area=None, leaves=64, prog=None):
     if initial_bound_area is None:
         initial_bound_area = bound_area(bounds)
-    found = cached_leaf_find_segments_v4(bounds)
-    for segment in found:
-        if segment.id not in found_previously:
-            yield segment
-            found_previously.add(segment.id)
-    if found and len(found) > 1 and bound_area(bounds) >= initial_bound_area / leaves * 4 - 1e-12:
-        for quad in quadrants(bounds):
-            yield from recursive_find_segments(quad, found_previously, initial_bound_area=initial_bound_area)
+    with ExitStack() as stack:
+        if prog is None:
+            prog = stack.enter_context(tqdm(total=initial_bound_area, desc='Finding segments'))
+        found = cached_leaf_find_segments_v4(bounds)
+        for segment in found:
+            if segment.id not in found_previously:
+                yield segment
+                found_previously.add(segment.id)
+        current_area = bound_area(bounds)
+        if found and len(found) > 1 and current_area >= initial_bound_area / leaves * 4 - 1e-12:
+            for quad in quadrants(bounds):
+                yield from recursive_find_segments(quad, found_previously, initial_bound_area=initial_bound_area)
+        else:
+            prog.update(current_area)
 
 def get_smoothed_distances_and_elevations(segment):
     lat_lon_list = polyline.decode(segment.points)
@@ -307,6 +315,7 @@ def analyze_segment_difficulty(segment, power_curve_times, power_curve_powers, p
     return ratio[argmax], times[argmax], elev_diff, distance, avg_grade
 
 def get_good_climbs_within_bounds(bounds):
+    power_curve_times, power_curve_powers = get_max_power_curve()
     segments = recursive_find_segments(bounds, set())
     segments = (seg for seg in segments if float('%f' % seg.elev_difference) > 75)
     res = []
@@ -321,15 +330,16 @@ def get_good_climbs_within_bounds(bounds):
     return df[(df['effort_count'] >= 100) & (df['avg_grade'] < 18.0)].sort_values('max_ratio', ascending=False)
 
 ACADIA_BOUNDS = [44.209880, -68.438608, 44.486288, -67.930362]
+NH_BOUNDS = [42.548259, -71.893737, 43.227170, -70.562190]
 
 if __name__ == '__main__':
-    power_curve_times, power_curve_powers = get_max_power_curve()
+    # power_curve_times, power_curve_powers = get_max_power_curve()
     # plot_power_curve(power_curve_times, power_curve_powers)
     # plt.savefig('power_curve.png')
     # bounds = [42.513076,-72.181450,43.618804,-70.774689]
     # for quad in quadrants(bounds):
     #     print(quad)
     # blah
-    bounds = ACADIA_BOUNDS
+    bounds = NH_BOUNDS
     # bounds = [44.307772,-68.285002, 44.359806,-68.253086]
-    get_good_climbs_within_bounds(bounds).to_csv('acadia_climbs.csv')
+    get_good_climbs_within_bounds(bounds).to_csv('nh_climbs.csv')
