@@ -1,7 +1,10 @@
 import datetime
 from functools import wraps
 import json
+import math
 import os
+from lat_lon_distance import calculate_cumulative_distance
+from power_model import power_required
 from stravalib.client import Client
 import time
 from threading import Barrier
@@ -12,6 +15,12 @@ import numpy as np
 from scipy.integrate import cumulative_trapezoid
 from cache_to_disk import cache_to_disk
 from matplotlib import pyplot as plt
+import polyline
+from scipy.signal import savgol_filter
+import jax.numpy as jnp
+import pandas as pd
+
+from elevation import get_elevation
 
 CACHE_DAYS = 365 * 1000
 
@@ -122,13 +131,18 @@ def no_none(lst):
 
 @cache_to_disk(CACHE_DAYS)
 def get_power_curve(min_time, max_time, intervals, activity_id):
-    power_curve_times = np.logspace(min_time, max_time, intervals)
     streams = StravaAPI.instance().client.get_activity_streams(activity_id, types=['time', 'watts'])
     if 'watts' not in streams or 'time' not in streams:
         return [], []
     assert len(streams['watts'].data) == len(streams['time'].data)
     xp = np.array(no_none(streams['time'].data))
     dir_yp = np.array(no_none(streams['watts'].data))
+    return compute_power_curve(min_time, max_time, intervals, xp, dir_yp)
+
+def compute_power_curve(min_time, max_time, intervals, time, power):
+    xp = time
+    dir_yp = power
+    power_curve_times = np.logspace(min_time, max_time, intervals)
     xp = xp[~np.isnan(dir_yp)]
     dir_yp = dir_yp[~np.isnan(dir_yp)]
     if len(xp) == 0:
@@ -202,20 +216,120 @@ def recursive_find_segments(bounds, found_previously, initial_bound_area=None, l
         for quad in quadrants(bounds):
             yield from recursive_find_segments(quad, found_previously, initial_bound_area=initial_bound_area)
 
+def get_smoothed_distances_and_elevations(segment):
+    lat_lon_list = polyline.decode(segment.points)
+    elevations = get_elevation(lat_lon_list)
+    distances = calculate_cumulative_distance(lat_lon_list)
+
+    total_points = int(math.ceil(distances[-1] / 10)) # point every 10 meters
+    distances_interp = np.linspace(0, distances[-1], total_points)
+    elevations_interp = np.interp(distances_interp, distances, elevations)
+
+    elevations_smoothed = savgol_filter(elevations_interp, min(101, elevations_interp.shape[0]), 3)
+    return distances_interp, elevations_smoothed
+
+def compute_grade_from_elevations(distances, elevations):
+    return np.diff(elevations) / np.diff(distances)
+
+@cache_to_disk(CACHE_DAYS)
+def get_segment(segment_id):
+    return StravaAPI.instance().client.get_segment(segment_id)
+
+def analyze_segment_difficulty(segment, power_curve_times, power_curve_powers, plot=None, cda=0.38901642, crr=0.03021691, weight_kg=82.5, rho=2.63754, low_gear_speed=2.63754):
+    distances, elevations = get_smoothed_distances_and_elevations(segment)
+    elev_diff = elevations[-1] - elevations[0]
+    avg_grade = elev_diff / distances[-1]
+    distance = distances[-1]
+
+    if plot:
+        plt.clf()
+        plt.figure()
+        plt.plot(distances, elevations)
+        plt.grid()
+        plt.legend()
+        plt.xlabel('Distance (m)')
+        plt.ylabel('Elevation (m)')
+        plt.title(segment.name)
+        plt.savefig(os.path.join(plot, 'elevation.png'))
+
+    grade = compute_grade_from_elevations(distances, elevations)
+
+    if plot:
+        plt.clf()
+        plt.figure()
+        plt.plot(distances[:-1], grade)
+        plt.grid()
+        plt.legend()
+        plt.xlabel('Distance (m)')
+        plt.ylabel('Grade (%)')
+        plt.title(segment.name)
+        plt.savefig(os.path.join(plot, 'grade.png'))
+
+    powers = power_required(
+        grade=jnp.array(grade * 100),
+        weight_kg=weight_kg,
+        c_rr=crr,
+        v_headwind=0,
+        v_groundspeed=low_gear_speed, # m/s
+        cda=cda,  # m^2
+        rho=rho,  # kg/m^3
+        loss_drivetrain=2,
+    )
+    if plot:
+        plt.clf()
+        plt.figure()
+        plt.plot(distances[:-1], powers)
+        plt.grid()
+        plt.legend()
+        plt.xlabel('Distance (m)')
+        plt.ylabel('Power (W)')
+        plt.title(segment.name)
+        plt.savefig(os.path.join(plot, 'power.png'))
+
+    times, pc_powers = compute_power_curve(0, np.log10(60 * 60 * 2), 50, distances[:-1] / low_gear_speed, powers)
+    if plot:
+        plt.clf()
+        plt.figure()
+        plt.plot(times, pc_powers, label='segment power curve')
+        plt.plot(power_curve_times, power_curve_powers, ls='--', c='r', label='my power curve')
+        plt.grid()
+        plt.legend()
+        plt.xlabel('Time (s)')
+        plt.ylabel('Power (W)')
+        plt.title(segment.name)
+        plt.semilogx()
+        plt.legend()
+        plt.savefig(os.path.join(plot, 'power_curve.png'))
+
+    my_power_curve_powers_at_times = np.interp(times, power_curve_times, power_curve_powers, left=np.nan, right=np.nan)
+    ratio = pc_powers / my_power_curve_powers_at_times
+    argmax = np.nanargmax(ratio)
+    return ratio[argmax], times[argmax], elev_diff, distance, avg_grade
+
+def get_good_climbs_within_bounds(bounds):
+    segments = recursive_find_segments(bounds, set())
+    segments = (seg for seg in segments if float('%f' % seg.elev_difference) > 75)
+    res = []
+    for i, segment in enumerate(segments):
+        plot = None
+        if segment.id == 7295880:
+            plot = '.'
+        max_ratio, max_ratio_time, elev_diff, distance, avg_grade = analyze_segment_difficulty(segment, power_curve_times, power_curve_powers, plot=plot)
+        full_segment = get_segment(segment.id)
+        res.append({'id': segment.id, 'name': segment.name, 'max_ratio': max_ratio, 'max_ratio_time': max_ratio_time, 'elev_difference': elev_diff, 'distance': distance, 'avg_grade': avg_grade * 100, 'effort_count': full_segment.effort_count, 'hazardous': full_segment.hazardous})
+    df = pd.DataFrame(res)
+    return df[(df['effort_count'] >= 100) & (df['avg_grade'] < 18.0)].sort_values('max_ratio', ascending=False)
+
+ACADIA_BOUNDS = [44.209880, -68.438608, 44.486288, -67.930362]
 
 if __name__ == '__main__':
-    # power_curve_times, power_curve_powers = get_max_power_curve()
+    power_curve_times, power_curve_powers = get_max_power_curve()
     # plot_power_curve(power_curve_times, power_curve_powers)
     # plt.savefig('power_curve.png')
     # bounds = [42.513076,-72.181450,43.618804,-70.774689]
     # for quad in quadrants(bounds):
     #     print(quad)
     # blah
-    bounds = [44.209880, -68.438608, 44.486288, -67.930362]
+    bounds = ACADIA_BOUNDS
     # bounds = [44.307772,-68.285002, 44.359806,-68.253086]
-    segments = recursive_find_segments(bounds, set())
-    segments = (seg for seg in segments if float('%f' % seg.elev_difference) > 75)
-    for i, segment in enumerate(segments):
-        # if i > 20:
-        #     break
-        print("%.1f %.1f %.0f %s" % (segment.avg_grade, segment.distance, segment.elev_difference, segment.name))
+    get_good_climbs_within_bounds(bounds).to_csv('acadia_climbs.csv')
