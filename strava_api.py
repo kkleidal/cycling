@@ -5,6 +5,7 @@ import json
 import math
 import os
 from lat_lon_distance import calculate_cumulative_distance
+from maps import get_primary_surface, time_to_travel
 from power_model import power_required
 from stravalib.client import Client
 import time
@@ -220,7 +221,7 @@ def recursive_find_segments(bounds, found_previously, initial_bound_area=None, l
         current_area = bound_area(bounds)
         if found and len(found) > 1 and current_area >= initial_bound_area / leaves * 4 - 1e-12:
             for quad in quadrants(bounds):
-                yield from recursive_find_segments(quad, found_previously, initial_bound_area=initial_bound_area)
+                yield from recursive_find_segments(quad, found_previously, initial_bound_area=initial_bound_area, prog=prog)
         else:
             prog.update(current_area)
 
@@ -325,12 +326,17 @@ def get_good_climbs_within_bounds(bounds):
             plot = '.'
         max_ratio, max_ratio_time, elev_diff, distance, avg_grade = analyze_segment_difficulty(segment, power_curve_times, power_curve_powers, plot=plot)
         full_segment = get_segment(segment.id)
-        res.append({'id': segment.id, 'name': segment.name, 'max_ratio': max_ratio, 'max_ratio_time': max_ratio_time, 'elev_difference': elev_diff, 'distance': distance, 'avg_grade': avg_grade * 100, 'effort_count': full_segment.effort_count, 'hazardous': full_segment.hazardous})
+        start_loc = (full_segment.start_latlng.lat, full_segment.end_latlng.lon)
+        points = polyline.decode(segment.points)
+        primary_surface, primary_surface_confidence = get_primary_surface(points)
+        time_to_drive = time_to_travel(start_loc)
+        res.append({'id': segment.id, 'name': segment.name, 'max_ratio': max_ratio, 'max_ratio_time': max_ratio_time, 'elev_difference': elev_diff, 'distance': distance, 'avg_grade': avg_grade * 100, 'effort_count': full_segment.effort_count, 'hazardous': full_segment.hazardous, 'time_to_drive': time_to_drive, 'primary_surface': primary_surface, 'primary_surface_confidence': primary_surface_confidence})
     df = pd.DataFrame(res)
     return df[(df['effort_count'] >= 100) & (df['avg_grade'] < 18.0)].sort_values('max_ratio', ascending=False)
 
 ACADIA_BOUNDS = [44.209880, -68.438608, 44.486288, -67.930362]
 NH_BOUNDS = [42.548259, -71.893737, 43.227170, -70.562190]
+NH_SMALL = [42.715044, -71.893737, 43.227170, -71.191475]
 
 if __name__ == '__main__':
     # power_curve_times, power_curve_powers = get_max_power_curve()
@@ -340,6 +346,6 @@ if __name__ == '__main__':
     # for quad in quadrants(bounds):
     #     print(quad)
     # blah
-    bounds = NH_BOUNDS
+    bounds = NH_SMALL
     # bounds = [44.307772,-68.285002, 44.359806,-68.253086]
     get_good_climbs_within_bounds(bounds).to_csv('nh_climbs.csv')

@@ -4,3 +4,4 @@
 *.fit
 *.csv
 __pycache__
+cache
