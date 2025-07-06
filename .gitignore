@@ -5,3 +5,5 @@
 *.csv
 __pycache__
 cache
+strava_token.json
+*.pkl.gz
