@@ -10,7 +10,7 @@ from strava_auth import authorize_strava
 from stravalib.client import Client
 
 def run_analytics(gear_mapping, activity_table):
-    artificial_date = date(2025, 6, 1)
+    artificial_date = None  # date(2024, 5, 15)
     if artificial_date is None:
         artificial_date = datetime.now().date()
     activity_table = activity_table[activity_table["activity_date"] <= artificial_date]
