@@ -344,6 +344,7 @@ def impute_power(
     treat_leading_zeros_as_missing: bool = True,
     auto_fit: bool = False,
     fit_headwind: bool = False,
+    ml_fit: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Impute missing power values with physics-model estimates.
@@ -386,9 +387,189 @@ def impute_power(
             missing = missing.copy()
             missing.iloc[:first_valid] = True
 
+    # ML fit: train on measured section, predict full ride
+    if ml_fit:
+        fold_models, feat_names, _cv, feat_df = fit_ml_model(df)
+        ml_mean, ml_std = apply_ml_model(fold_models, feat_df, feat_names)
+        df["power_ml_w"] = ml_mean
+        df["power_ml_std_w"] = ml_std
+        imputed_col = "power_ml_w"
+    else:
+        imputed_col = "power_model_w"
+
     df["power_source"] = np.where(missing, "model", "measured")
-    df["power_imputed_w"] = np.where(missing, df["power_model_w"], df["power_w"])
+    df["power_imputed_w"] = np.where(missing, df[imputed_col], df["power_w"])
     return df, p
+
+
+# ---------------------------------------------------------------------------
+# ML-based imputation
+# ---------------------------------------------------------------------------
+
+def build_ml_features(
+    df: pd.DataFrame,
+    offsets_s: tuple = (-30, -10, -3, 0, 3, 10, 30),
+) -> pd.DataFrame:
+    """
+    Build feature matrix for ML power prediction using temporal lag/lead features.
+
+    Features
+    --------
+    power_model        — physics model output (primary predictor; lets ML correct it)
+    speed_{tag}        — smoothed speed at time offset (m/s)
+    grade_{tag}        — gradient at time offset (%)
+
+    Tags: tm30, tm10, tm3, t0, tp3, tp10, tp30 for offsets -30..+30 s.
+
+    Using time-offset features (rather than rolling stats or cadence/HR) ensures
+    the feature matrix is valid everywhere in the ride — GPS-derived speed and
+    grade are always available, even in the missing-power section.
+
+    HR and cadence are intentionally excluded: both sensors are absent when the
+    power meter is absent, so including them would teach "sensor=0 → low power".
+    """
+    feats: dict[str, np.ndarray] = {}
+    feats["power_model"] = df["power_model_w"].values.astype(float)
+
+    grade = pd.Series(df["grade_pct"].values.astype(float), index=df.index)
+    speed = pd.Series(df["speed_smooth_ms"].values.astype(float), index=df.index)
+
+    for offset in offsets_s:
+        if offset == 0:
+            tag = "t0"
+        elif offset < 0:
+            tag = f"tm{abs(offset)}"
+        else:
+            tag = f"tp{offset}"
+        # shift(-N) brings future values into the current row; shift(+N) brings past values
+        feats[f"speed_{tag}"] = speed.shift(-offset).values
+        feats[f"grade_{tag}"] = grade.shift(-offset).values
+
+    return pd.DataFrame(feats, index=df.index)
+
+
+def fit_ml_model(
+    df: pd.DataFrame,
+    cv_splits: int = 5,
+):
+    """
+    Fit ML power models to the measured section, validated with TimeSeriesSplit.
+
+    Tries Ridge regression and XGBoost; picks the better CV R².
+
+    Returns
+    -------
+    (fitted_model, feature_names, cv_results)
+    """
+    from sklearn.linear_model import RidgeCV
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+    from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
+    try:
+        from xgboost import XGBRegressor
+        _has_xgb = True
+    except ImportError:
+        _has_xgb = False
+
+    feat_df = build_ml_features(df)
+    feature_names = list(feat_df.columns)
+
+    # Training set: measured, pedalling (power > 0), no extreme accelerations
+    meas_mask = (
+        df["power_w"].notna()
+        & (df["power_w"] > 0)
+        & (df["accel_ms2"].abs() < 1.5)
+    )
+    X_all = feat_df.values.astype(float)
+    y_all = df["power_w"].values.astype(float)
+
+    train_idx = np.where(meas_mask.values)[0]
+    X_tr = X_all[train_idx]
+    y_tr = y_all[train_idx]
+
+    # Drop rows with NaN features (e.g. edge of HR lead window)
+    valid = ~np.isnan(X_tr).any(axis=1)
+    X_tr, y_tr = X_tr[valid], y_tr[valid]
+
+    n_train = len(y_tr)
+    if n_train < 50:
+        raise ValueError(f"Only {n_train} training points — need ≥ 50 for ML fit.")
+
+    # ---- candidate models ----
+    alphas = [0.1, 1.0, 10.0, 100.0, 1000.0]
+    candidates = {
+        "ridge": Pipeline([
+            ("scaler", StandardScaler()),
+            ("reg",    RidgeCV(alphas=alphas, cv=TimeSeriesSplit(n_splits=cv_splits))),
+        ]),
+    }
+    if _has_xgb:
+        candidates["xgb"] = XGBRegressor(
+            n_estimators=400,
+            max_depth=4,
+            learning_rate=0.04,
+            subsample=0.8,
+            colsample_bytree=0.7,
+            min_child_weight=15,   # strong regularisation against small-sample overfitting
+            reg_lambda=5.0,
+            random_state=42,
+            verbosity=0,
+        )
+
+    import copy
+
+    tscv = TimeSeriesSplit(n_splits=cv_splits)
+    cv_results: dict[str, np.ndarray] = {}
+
+    print(f"\nML cross-validation  ({cv_splits}-fold time-series, {n_train:,} training pts)")
+    print(f"Features: {feature_names}")
+    for name, model in candidates.items():
+        scores = cross_val_score(model, X_tr, y_tr, cv=tscv, scoring="r2")
+        cv_results[name] = scores
+        print(f"  {name:8s}: R² = {scores.mean():.3f} ± {scores.std():.3f}")
+
+    best_name = max(cv_results, key=lambda k: cv_results[k].mean())
+
+    # Build an ensemble: one model per fold, each trained on that fold's training split.
+    # This gives us cv_splits predictions per sample → mean + std for uncertainty bands.
+    fold_models = []
+    for train_fold_idx, _ in tscv.split(X_tr):
+        m = copy.deepcopy(candidates[best_name])
+        m.fit(X_tr[train_fold_idx], y_tr[train_fold_idx])
+        fold_models.append(m)
+
+    if _has_xgb and best_name == "xgb":
+        # Average feature importances across folds for reporting
+        importances = np.mean([m.feature_importances_ for m in fold_models], axis=0)
+        ranked = sorted(zip(feature_names, importances), key=lambda x: -x[1])
+        print(f"  → Using {best_name} ensemble ({len(fold_models)} folds)  |  feature importances: " +
+              ", ".join(f"{n}={v:.3f}" for n, v in ranked))
+    else:
+        print(f"  → Using {best_name} ensemble ({len(fold_models)} folds)")
+
+    return fold_models, feature_names, cv_results, feat_df
+
+
+def apply_ml_model(
+    fold_models: list,
+    feat_df: pd.DataFrame,
+    feature_names: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Run each fold model on the full-ride feature matrix.
+
+    Returns
+    -------
+    mean_pred : np.ndarray  — ensemble mean power (≥ 0), shape (n,)
+    std_pred  : np.ndarray  — ensemble std (uncertainty), shape (n,)
+    """
+    X = feat_df[feature_names].values.astype(float)
+    col_medians = np.nanmedian(X, axis=0)
+    nan_mask = np.isnan(X)
+    X[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
+    preds = np.stack([np.maximum(m.predict(X), 0.0) for m in fold_models], axis=0)
+    return preds.mean(axis=0), preds.std(axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -397,16 +578,18 @@ def impute_power(
 
 def plot_imputed_power(df: pd.DataFrame, output_path: str, smooth_window: int = 30) -> None:
     """
-    Save a figure showing physics-model power vs measured power over the full
-    ride, with elevation as a gray background fill.
+    Save a figure showing model power vs measured power over the full ride,
+    with elevation as a gray background fill.  When ML predictions are present
+    (power_ml_w column), both the physics model and ML lines are drawn.
     """
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
     df = df.copy()
-    df["model_smooth"]   = df["power_model_w"].rolling(smooth_window, center=True, min_periods=1).mean()
-    df["measured_smooth"] = df["power_w"].rolling(smooth_window, center=True, min_periods=1).mean()
+    roll = lambda col: df[col].rolling(smooth_window, center=True, min_periods=1).mean()
 
+    has_ml = "power_ml_w" in df.columns
+    has_ml_std = "power_ml_std_w" in df.columns
     first_meas_idx = (df["power_source"] == "measured").values.argmax()
     transition_time = df.loc[first_meas_idx, "time"]
 
@@ -418,20 +601,43 @@ def plot_imputed_power(df: pd.DataFrame, output_path: str, smooth_window: int = 
     ax2.tick_params(axis="y", labelcolor="gray")
     ax2.set_ylim(0, df["elevation_m"].max() * 3.5)
 
-    ax.plot(df["time"], df["model_smooth"], color="tomato", lw=1.3, alpha=0.85,
+    # Physics model — always shown (dimmed when ML is also present)
+    physics_alpha = 0.45 if has_ml else 0.85
+    ax.plot(df["time"], roll("power_model_w"),
+            color="tomato", lw=1.1, alpha=physics_alpha,
             label=f"Physics model ({smooth_window} s avg)", zorder=3)
-    ax.plot(df["time"], df["measured_smooth"], color="steelblue", lw=1.3, alpha=0.85,
-            label=f"Measured power ({smooth_window} s avg)", zorder=4)
 
-    ax.axvline(transition_time, color="black", lw=1.2, ls="--", alpha=0.6, zorder=5)
-    ax.text(transition_time, ax.get_ylim()[1] if ax.get_ylim()[1] > 10 else 500,
-            " meter\n on", fontsize=8, va="top", color="black", alpha=0.7)
+    # ML model — shown on top when available, with ±1 std fill band
+    if has_ml:
+        ml_mean = roll("power_ml_w")
+        ax.plot(df["time"], ml_mean,
+                color="darkorange", lw=1.4, alpha=0.9,
+                label=f"ML model ({smooth_window} s avg)", zorder=4)
+        if has_ml_std:
+            ml_std = df["power_ml_std_w"].rolling(smooth_window, center=True, min_periods=1).mean()
+            ax.fill_between(
+                df["time"],
+                np.maximum(ml_mean - ml_std, 0),
+                ml_mean + ml_std,
+                color="darkorange", alpha=0.18, zorder=3,
+                label="ML ±1 std (ensemble)",
+            )
+
+    # Measured
+    ax.plot(df["time"], roll("power_w"),
+            color="steelblue", lw=1.3, alpha=0.85,
+            label=f"Measured power ({smooth_window} s avg)", zorder=5)
+
+    ax.axvline(transition_time, color="black", lw=1.2, ls="--", alpha=0.6, zorder=6)
+    ax.text(transition_time, 500, " meter\n on", fontsize=8, va="top",
+            color="black", alpha=0.7)
     ax.axvspan(df["time"].iloc[0], transition_time, alpha=0.07, color="tomato",
                zorder=2, label="Imputed section")
 
+    title = "ML + physics model vs measured power" if has_ml else "Physics model vs measured power"
+    ax.set_title(f"{title} — full ride", fontsize=13)
     ax.set_xlabel("Time", fontsize=11)
     ax.set_ylabel("Power (W)", fontsize=11)
-    ax.set_title("Physics model vs measured power — full ride", fontsize=13)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=range(0, 90, 5)))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
@@ -439,8 +645,8 @@ def plot_imputed_power(df: pd.DataFrame, output_path: str, smooth_window: int = 
     ax.grid(axis="y", alpha=0.25, zorder=1)
     ax.set_zorder(ax2.get_zorder() + 1)
     ax.patch.set_visible(False)
-    ax.legend(ax.get_legend_handles_labels()[0], ax.get_legend_handles_labels()[1],
-              fontsize=10, loc="upper right")
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles, labels, fontsize=10, loc="upper right")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -493,11 +699,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    metavar="PCT",
                    help=f"Drivetrain loss %% (default: {DEFAULT_PARAMS['loss_drivetrain']})")
 
-    g2 = p.add_argument_group("auto-fitting")
+    g2 = p.add_argument_group("auto-fitting / ML")
     g2.add_argument("--auto-fit", action="store_true",
                     help="Fit CdA and Crr from the measured power section")
     g2.add_argument("--fit-headwind", action="store_true",
                     help="Also fit an effective headwind term (requires --auto-fit)")
+    g2.add_argument("--ml-fit", action="store_true",
+                    help="Train an ML model (Ridge + XGBoost) on the measured section "
+                         "with time-series CV; uses physics model output plus HR, "
+                         "cadence, and rolling terrain features as inputs")
 
     g3 = p.add_argument_group("smoothing / misc")
     g3.add_argument("--smooth-window", type=int, default=21, metavar="N",
@@ -535,6 +745,7 @@ def main(argv=None):
         treat_leading_zeros_as_missing=not args.no_treat_zeros,
         auto_fit=args.auto_fit,
         fit_headwind=args.fit_headwind,
+        ml_fit=args.ml_fit,
     )
 
     if not args.auto_fit:
