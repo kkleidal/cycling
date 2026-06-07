@@ -1,0 +1,60 @@
+{
+  "spreadsheet_id": "1GH6rit4DXX69Bw4AXTQRBcG6KRKvyKx0ll7T5TMF6BE",
+  "summary_sheet_gid": 1896319394,
+  "checkpoint_path": "gear_mileage_checkpoint.pkl.gz",
+  "pending_maintenance_csv": "pending_maintenance.csv",
+  "maintenance_threshold": 0.8,
+  "users": [
+    {
+      "key": "ken",
+      "name": "Ken",
+      "strava": {
+        "client_id_env": "STRAVA_CLIENT_ID",
+        "client_secret_env": "STRAVA_CLIENT_SECRET",
+        "token_cache": "strava_tokens/ken.json"
+      },
+      "bikes": [
+        {
+          "key": "revolt",
+          "name": "Gravel - Giant Revolt",
+          "summary_row_name": "Gravel - Giant Revolt",
+          "component_sheet": "Revolt Comp",
+          "match_names": [
+            "Gravel - Giant Revolt"
+          ]
+        },
+        {
+          "key": "emonda",
+          "name": "Émonda",
+          "summary_row_name": "Émonda",
+          "component_sheet": "Emonda Comp",
+          "match_names": [
+            "Émonda"
+          ]
+        }
+      ]
+    },
+    {
+      "key": "lauren",
+      "name": "Lauren",
+      "strava": {
+        "client_id_env": "STRAVA_CLIENT_ID",
+        "client_secret_env": "STRAVA_CLIENT_SECRET",
+        "token_cache": "strava_tokens/lauren.json"
+      },
+      "bikes": [
+        {
+          "key": "turbo-creo-ii",
+          "name": "Turbo Creo II",
+          "summary_row_name": "Turbo Creo II",
+          "component_sheet": "Turbo Creo II Comp",
+          "match_names": [
+            "Turbo Creo 2",
+            "Turbo Creo II",
+            "Lauren's Turbo Creo II"
+          ]
+        }
+      ]
+    }
+  ]
+}
