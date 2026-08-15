@@ -65,8 +65,19 @@ def _resolve_path(base_dir, raw_path):
 
 
 def _get_sheets_client():
-    """Authenticated gspread client."""
+    """Authenticated gspread client.
+
+    Prefers a service account JSON key when available so unattended cron runs
+    do not depend on an end-user OAuth refresh token.
+    """
     import gspread
+
+    service_account_file = os.environ.get(
+        "GSPREAD_SERVICE_ACCOUNT_FILE",
+        str(Path.home() / ".config/gspread/service_account.json"),
+    )
+    if os.path.exists(service_account_file):
+        return gspread.service_account(filename=service_account_file)
 
     return gspread.oauth()
 

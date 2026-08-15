@@ -20,21 +20,39 @@ update the shared Google Sheet, and keep a CSV ledger of pending maintenance.
    authorization. Tokens are stored at the configured `strava.token_cache`
    paths, so Ken and Lauren can each keep an independent token.
 
-## Google Sheets auth setup (one-time)
+## Google Sheets auth setup
 
-The `--update-sheet`, `--check-maintenance`, and `--sync-maintenance-csv` flags
-require OAuth2 credentials for the Google Sheets API.
+The tracker now prefers a Google service account for unattended runs. If the
+service account key file is present, the script will use it automatically and
+skip end-user browser auth.
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create or
-   select a project.
-2. Enable the **Google Sheets API** and **Google Drive API** for the project.
-3. Go to **APIs & Services -> Credentials -> Create Credentials -> OAuth 2.0 Client ID**.
-4. Choose **Desktop app** as the application type.
-5. Download the credentials JSON and save it to:
+### Preferred: service account
+
+1. In Google Cloud Console, create or select a project.
+2. Enable the **Google Sheets API** and **Google Drive API**.
+3. Create a service account under **IAM & Admin -> Service Accounts**.
+4. Create a JSON key for that service account and save it to:
+   ```
+   ~/.config/gspread/service_account.json
+   ```
+   You can also point the tracker at a different path with
+   `GSPREAD_SERVICE_ACCOUNT_FILE=/path/to/key.json`.
+5. Open the JSON file and copy the service account email, which looks like:
+   `name@project-id.iam.gserviceaccount.com`
+6. Share the maintenance spreadsheet with that email as an editor.
+
+### Fallback: desktop OAuth
+
+If no service account key file is present, the tracker falls back to OAuth2
+desktop auth.
+
+1. Go to **APIs & Services -> Credentials -> Create Credentials -> OAuth 2.0 Client ID**.
+2. Choose **Desktop app** as the application type.
+3. Download the credentials JSON and save it to:
    ```
    ~/.config/gspread/credentials.json
    ```
-6. On first run with any Sheets-related flag, a browser window will open asking
+4. On first run with any Sheets-related flag, a browser window will open asking
    you to authorize. The token is cached at
    `~/.config/gspread/authorized_user.json` and reused on subsequent runs.
 

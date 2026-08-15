@@ -8,3 +8,5 @@ cache
 strava_token.json
 *.pkl.gz
 strava_tokens/
+logs/
+.claude/settings.local.json
